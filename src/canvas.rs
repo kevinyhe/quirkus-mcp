@@ -38,6 +38,7 @@ pub struct Canvas {
     limit: Semaphore,
     cache_dir: PathBuf,
     auth_file: PathBuf,
+    keychain: bool,
 }
 
 #[derive(Debug)]
@@ -125,14 +126,20 @@ fn is_signed_out(body: &str) -> bool {
 }
 
 impl Canvas {
+    // real use: read the session from the OS keychain (the app put it there), file as fallback
     pub fn new(cache_dir: PathBuf, config_dir: PathBuf) -> Self {
-        Self::with_base(BASE, cache_dir, config_dir)
+        Self::build(BASE, cache_dir, config_dir, true)
     }
 
+    // tests / QUERCUS_BASE_URL: file only
     pub fn with_base(base: &str, cache_dir: PathBuf, config_dir: PathBuf) -> Self {
+        Self::build(base, cache_dir, config_dir, false)
+    }
+
+    fn build(base: &str, cache_dir: PathBuf, config_dir: PathBuf, keychain: bool) -> Self {
         let _ = std::fs::create_dir_all(&cache_dir);
         let auth_file = config_dir.join("auth.json");
-        let session = std::fs::read(&auth_file).ok().and_then(|b| serde_json::from_slice::<Auth>(&b).ok()).map(|a| build_session(&a));
+        let session = read_secret(keychain, &auth_file).as_deref().and_then(|b| serde_json::from_slice::<Auth>(b).ok()).map(|a| build_session(&a));
         Canvas {
             base: base.trim_end_matches('/').to_string(),
             session,
@@ -141,6 +148,7 @@ impl Canvas {
             limit: Semaphore::new(6),
             cache_dir,
             auth_file,
+            keychain,
         }
     }
 
@@ -164,7 +172,7 @@ impl Canvas {
         let mut saved = self.saved_cookies.lock().unwrap();
         if *saved != h {
             if let Ok(b) = serde_json::to_vec(&Auth::Cookie(h.clone())) {
-                write_private(&self.auth_file, &b);
+                self.write_secret(&b);
             }
             *saved = h;
         }
@@ -266,10 +274,40 @@ impl Canvas {
     }
 
     // any quercus url (file downloads), with the user's creds
+    // save a rotated cookie: keychain when enabled and reachable, else the 0600 file
+    fn write_secret(&self, bytes: &[u8]) {
+        if self.keychain {
+            if let Ok(s) = std::str::from_utf8(bytes) {
+                if keyring_set(s).is_ok() {
+                    let _ = std::fs::remove_file(&self.auth_file);
+                    return;
+                }
+            }
+        }
+        write_private(&self.auth_file, bytes);
+    }
+
     pub async fn raw(&self, url: &str) -> Result<reqwest::Response, Error> {
         let http = self.client()?;
         self.send(&http, url, "*/*").await
     }
+}
+
+// Same keychain entry the app writes, so the server reads the app's session.
+const KEYRING_SERVICE: &str = "io.github.kevinyhe.quirkus";
+const KEYRING_USER: &str = "quercus-session";
+
+fn keyring_set(value: &str) -> Result<(), ()> {
+    keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|_| ())?.set_password(value).map_err(|_| ())
+}
+
+fn read_secret(keychain: bool, file: &std::path::Path) -> Option<Vec<u8>> {
+    if keychain {
+        if let Ok(v) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).and_then(|e| e.get_password()) {
+            return Some(v.into_bytes());
+        }
+    }
+    std::fs::read(file).ok()
 }
 
 // 0600, written via tmp + rename
@@ -284,4 +322,20 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) {
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
     }
     let _ = std::fs::rename(&tmp, path);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_secret_uses_the_file_when_the_keychain_is_off() {
+        let dir = std::env::temp_dir().join(format!("qmcp-secret-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("auth.json");
+        assert!(read_secret(false, &f).is_none());
+        std::fs::write(&f, br#"{"kind":"token","value":"x"}"#).unwrap();
+        assert_eq!(read_secret(false, &f).as_deref(), Some(&br#"{"kind":"token","value":"x"}"#[..]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
